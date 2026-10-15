@@ -2,8 +2,8 @@
 
 A web app for annotating photos and videos on your own GPU, organised into **projects**:
 
-- **Object detection.** You get boxes and labels from a vision-language model you pick: Qwen, DeepSeek, Gemini, GPT-6 Sol or GPT-6 Astra, all through OpenRouter. Spending is capped.
-- **Segmentation.** SAM 3 runs on the local GPU and draws pixel-exact masks. Videos are tracked frame by frame. It's free.
+- **Object detection (photos).** You get boxes and labels from a vision-language model you pick: Qwen, DeepSeek, Gemini, GPT-6 Sol or GPT-6 Astra, all through OpenRouter. Spending is capped. These models take images, so detection is for photos only.
+- **Segmentation (photos and videos).** SAM 3 runs on the local GPU and draws pixel-exact masks. Videos are tracked frame by frame. It's free.
 
 ## Using it
 
@@ -47,11 +47,7 @@ Results are still labelled with the plain label.
 
 Every model answers with JSON boxes in 0–1000 coordinates. The parser also accepts code fences, 0–1 fractions, `bbox_2d` keys, and repeated keys inside one object; some Qwen providers produce the last of these. A reply that can't be parsed is retried once.
 
-For a video, the model checks frames at a steady rate (the "model checks per second" setting, default 1 per second), from the first frame to the last. The result is the **full video at its normal speed**:
-- **Between checks:** each box moves smoothly from one check to the next, matched to the same object by position.
-- **Objects seen in only one check:** shown just around that check.
-- **Glitched checks are skipped:** answers that loop or come back suddenly empty are thrown out, and so are checks with a count far above or below the others.
-- **Fast motion:** use more checks per second; each check is one paid call.
+If videos are selected while Object detection is chosen, they're skipped and the page says so. Use Segmentation for videos.
 
 **Label colours:** every label has a colour picker. Boxes and tags use that colour; segmentation masks use shades of it, so neighbouring objects stay distinguishable.
 
@@ -61,7 +57,7 @@ For a video, the model checks frames at a steady rate (the "model checks per sec
 - **Overall cap:** `DETECT_TOTAL_USD`, default **$20.00**.
 - **Real costs:** spend is counted from the actual cost OpenRouter reports for each call. It's kept in `data/usage.json` and shown in the page header.
 - **Checked before starting:** before a batch starts, its estimated cost is compared with what's left. A batch that doesn't fit is refused with a clear message, and each call is checked again as it runs.
-- **Calls per video:** capped by `DETECT_MAX_FRAMES` (default 120). Output is limited to 4096 tokens per call. Rate-limited calls (429) and server errors are retried with backoff.
+- **Per call:** output is limited to 4096 tokens. Rate-limited calls (429) and server errors are retried with backoff.
 - **The key's own limit:** the OpenRouter key also has its own credit limit, which OpenRouter enforces.
 
 ## Setup
@@ -82,7 +78,7 @@ cp .env.example .env      # set HF_TOKEN, OPENROUTER_API_KEY, APP_PASSWORD
 | `OPENROUTER_API_KEY` | – | enables object detection |
 | `APP_PASSWORD` | empty | the access key; empty means open to anyone |
 | `DETECT_DAILY_USD` / `DETECT_TOTAL_USD` | 2.00 / 20.00 | detection spending caps |
-| `DETECT_MAX_FRAMES` | 120 | maximum model calls (checks) per video in detection |
+| `MAX_TRACK_OBJECTS` | 20 | maximum objects SAM 3 tracks at once in a video (GPU memory grows with each) |
 | `DETECT_WORKERS` | 3 | detection calls running in parallel |
 | `MAX_UPLOAD_MB` | 1024 | per-file upload limit |
 | `MAX_FRAMES_LIMIT` | 600 | maximum frames tracked per video in segmentation |
@@ -131,6 +127,12 @@ Useful commands: `systemctl --user status sam3-tracker`, `journalctl --user -u s
 - `tracker.py`: the SAM 3 engine (video tracking, single-image segmentation, mask polygons, H.264 output).
 - `static/`: the page (plain HTML, CSS and JS, no build step).
 - `track_video.py`: the SAM 3 tracking engine from the command line.
+
+## Viewing and memory
+
+- **Viewer copies.** Every uploaded video and every tracking result also gets a light viewer copy: about 720p at 2.5 Mbit/s, built to start playing at once. The public link carries about 20 Mbit/s, so a 4K original at 24 Mbit/s would keep buffering. "Original" in the viewer shows the light copy. Downloads are always the full files.
+- **Result/Original toggle.** Both versions stay loaded, so switching is instant. For videos it keeps the same moment and play state.
+- **GPU memory.** SAM 3 keeps per-object memory and every frame's results while tracking. For videos longer than 40 processed frames, that state is kept in RAM rather than on the GPU. The number of objects tracked at once is capped (`MAX_TRACK_OBJECTS`). If a run still runs out of GPU memory, it's retried once with the state in RAM.
 
 ## Speed (Tesla T4)
 

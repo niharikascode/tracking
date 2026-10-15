@@ -11,11 +11,16 @@ pool. Access is protected by one shared access key (APP_PASSWORD).
 Run:  .venv/bin/uvicorn server:app --host 127.0.0.1 --port 7860
 """
 
-import hashlib
+import os
+
+# lets PyTorch reuse fragmented GPU memory (an OOM showed 3.5 GB reserved but unusable);
+# must be set before torch initialises CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import hashlib  # noqa: E402
 import hmac
 import io
 import json
-import os
 import queue
 import re
 import shutil
@@ -61,8 +66,8 @@ MAX_QUEUE = int(os.getenv("MAX_QUEUE", "100"))
 DTYPE = os.getenv("DTYPE", "fp16")
 DETECT_DAILY_USD = env_float("DETECT_DAILY_USD", "2.00")
 DETECT_TOTAL_USD = env_float("DETECT_TOTAL_USD", "20.00")
-DETECT_MAX_FRAMES = int(os.getenv("DETECT_MAX_FRAMES", "120"))   # max model calls per video
 DETECT_WORKERS = int(os.getenv("DETECT_WORKERS", "3"))
+MAX_TRACK_OBJECTS = int(os.getenv("MAX_TRACK_OBJECTS", "20"))   # SAM 3 objects tracked at once per video
 MAX_IMAGE_SIDE = 4096
 
 PROJECTS = DATA_DIR / "projects"
@@ -89,12 +94,24 @@ class State:
         self.gpu_queue: "queue.Queue[str]" = queue.Queue()
         self.gpu_order: list[str] = []
         self.gpu_running: str | None = None
-        self.sec_per_frame = 3.0
+        self.sec_per_frame = 3.0          # typical (median) of recent finished video runs
+        self.sec_per_frame_high = 8.0     # slow end (75th percentile)
         self.lock = threading.RLock()
 
 
 S = State()
 detect_pool = ThreadPoolExecutor(max_workers=DETECT_WORKERS, thread_name_prefix="detect")
+view_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="viewcopy")   # light copies for the browser
+
+
+def queue_view_copy(item):
+    """Make items/<id>/view.mp4 (light 720p copy) in the background; the viewer falls back to the original."""
+    def work():
+        d = idir(item)
+        if d.exists() and pipelines.make_view_copy(d / item["file"], d / "view.mp4") and item["id"] in S.items:
+            item["view"] = True
+            save_item(item)
+    view_pool.submit(work)
 
 
 def now():
@@ -156,6 +173,19 @@ def load_all():
             S.runs[run["id"]] = run
 
 
+def update_speed_estimate():
+    """Typical seconds per tracked frame, from the last 15 finished video segmentation runs."""
+    def spf_of(r):
+        res = r.get("result") or {}
+        return res.get("sec_per_frame") or (res["seconds"] / res["frames"] if res.get("seconds") and res.get("frames") else None)
+    done = sorted((r for r in S.runs.values() if r["task"] == "segment" and r["kind"] == "video"
+                   and r["state"] == "done" and spf_of(r)), key=lambda r: r["created_at"])[-15:]
+    spf = sorted(spf_of(r) for r in done)
+    if spf:
+        S.sec_per_frame = spf[len(spf) // 2]
+        S.sec_per_frame_high = max(S.sec_per_frame, spf[min(len(spf) - 1, (len(spf) * 3) // 4)])
+
+
 def touch_project(pid):
     p = S.projects.get(pid)
     if p:
@@ -171,7 +201,8 @@ def public_run(run: dict) -> dict:
         with S.lock:
             out["position"] = S.gpu_order.index(run["id"]) + 1 if run["id"] in S.gpu_order else 0
     if run["state"] == "running" and run["task"] == "segment" and run["kind"] == "video" and run["stage"] == "tracking":
-        out["eta_seconds"] = round(max(0, run["total"] - run["done"]) * S.sec_per_frame)
+        spf = run.get("_spf") or S.sec_per_frame        # this run's own speed once known
+        out["eta_seconds"] = round(max(0, run["total"] - run["done"]) * spf)
     return out
 
 
@@ -184,8 +215,7 @@ def make_progress(run):
             if t0[0] is None:
                 t0[0] = time.time()
             elif p.done > 1:
-                spf = (time.time() - t0[0]) / (p.done - 1)
-                S.sec_per_frame = 0.7 * S.sec_per_frame + 0.3 * spf
+                run["_spf"] = (time.time() - t0[0]) / (p.done - 1)
         if p.counts:
             run["counts"] = p.counts
         if p.preview is not None:
@@ -217,8 +247,8 @@ def execute(run: dict, fn):
         traceback.print_exc()
         msg = f"{type(e).__name__}: {e}"
         if "out of memory" in msg.lower():
-            msg = ("The GPU ran out of memory (it is shared with other jobs on this server). "
-                   "Try again, or use fewer frames / a shorter range.")
+            msg = ("Too many objects for the GPU's memory, even with tracking memory moved to RAM. "
+                   "Use fewer labels per run, a shorter time range or fewer frames.")
         run.update(state="failed", error=msg)
     finally:
         run["finished_at"] = now()
@@ -226,6 +256,7 @@ def execute(run: dict, fn):
             run.pop("_preview", None)
         save_run(run)
         touch_project(run["project_id"])
+        update_speed_estimate()
 
 
 def gpu_worker():
@@ -264,17 +295,16 @@ def detect_job(rid):
         run.update(state="failed", error="The item was deleted.")
         return
     src = idir(item) / item["file"]
-    fn = pipelines.detect_video if item["kind"] == "video" else pipelines.detect_image
-    if item["kind"] == "video":
-        execute(run, lambda out, prog, cancel: fn(src, out, run, budget, OPENROUTER_KEY, prog, cancel,
-                                                  max_calls=DETECT_MAX_FRAMES))
-    else:
-        execute(run, lambda out, prog, cancel: fn(src, out, run, budget, OPENROUTER_KEY, prog, cancel))
+    execute(run, lambda out, prog, cancel: pipelines.detect_image(src, out, run, budget, OPENROUTER_KEY, prog, cancel))
 
 
 @app.on_event("startup")
 def startup():
     load_all()
+    update_speed_estimate()
+    for it in list(S.items.values()):
+        if it["kind"] == "video" and not (idir(it) / "view.mp4").exists():
+            queue_view_copy(it)
     threading.Thread(target=gpu_worker, daemon=True, name="gpu-worker").start()
 
 
@@ -381,14 +411,14 @@ def status(request: Request):
     return {
         "model": S.model_status, "model_error": S.model_error,
         "gpu_busy": S.gpu_running is not None, "gpu_queue": len(S.gpu_order),
-        "sec_per_frame": round(S.sec_per_frame, 2),
+        "sec_per_frame": round(S.sec_per_frame, 2), "sec_per_frame_high": round(S.sec_per_frame_high, 2),
         "auth_required": bool(APP_PASSWORD), "authorized": authorized(request),
         "detection_enabled": bool(OPENROUTER_KEY),
         "budget": budget.summary(), "budget_remaining": round(budget.remaining(), 4),
         "models": [{"key": k, "name": m["name"], "id": m["id"], "note": m["note"],
                     "est_per_image": round(detector.estimate_cost(k, 1), 5)} for k, m in detector.MODELS.items()],
-        "limits": {"max_upload_mb": MAX_UPLOAD_MB, "max_frames": MAX_FRAMES_LIMIT,
-                   "detect_max_frames": DETECT_MAX_FRAMES},
+        "limits": {"max_upload_mb": MAX_UPLOAD_MB, "max_frames": MAX_FRAMES_LIMIT, "max_track_objects": MAX_TRACK_OBJECTS,
+},
     }
 
 
@@ -511,6 +541,7 @@ async def upload_items(pid: str, files: list[UploadFile]):
                 raw.rename(src)
                 item.update(file=src.name, meta=video_meta(src))
                 _video_thumb(src, d / "thumb.jpg", item["meta"]["frames"])
+                item["view"] = False
         except HTTPException as e:
             shutil.rmtree(d, ignore_errors=True)
             errors.append(e.detail)
@@ -521,6 +552,8 @@ async def upload_items(pid: str, files: list[UploadFile]):
             continue
         S.items[iid] = item
         save_item(item)
+        if kind == "video":
+            queue_view_copy(item)
         added.append(item_public(item))
     touch_project(pid)
     return {"added": added, "errors": errors}
@@ -550,10 +583,22 @@ def item_thumb(pid: str, iid: str):
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
-@app.get("/api/projects/{pid}/items/{iid}/source")
-def item_source(pid: str, iid: str):
+@app.get("/api/projects/{pid}/items/{iid}/view")
+def item_view(pid: str, iid: str):
+    """What the browser shows: the light copy of a video once it exists, otherwise the original."""
     item = get_item(pid, iid)
+    light = idir(item) / "view.mp4"
+    if item["kind"] == "video" and light.exists():
+        return FileResponse(light, media_type="video/mp4")
     return FileResponse(idir(item) / item["file"], media_type="image/jpeg" if item["kind"] == "image" else None)
+
+
+@app.get("/api/projects/{pid}/items/{iid}/source")
+def item_source(pid: str, iid: str, download: int = 0):
+    item = get_item(pid, iid)
+    return FileResponse(idir(item) / item["file"], media_type="image/jpeg" if item["kind"] == "image" else None,
+                        filename=item["name"] if download else None,
+                        content_disposition_type="attachment" if download else "inline")
 
 
 # ============================================================================ runs
@@ -568,7 +613,6 @@ class RunOptions(BaseModel):
     start: float = Field(default=0.0, ge=0)
     end: float | None = Field(default=None, ge=0)
     max_frames: int = Field(default=150, ge=1)          # video segmentation
-    detect_fps: float = Field(default=1.0, ge=0.1, le=5)  # video detection: model checks per second
     score_thresh: float = Field(default=0.0, ge=0, le=1)
     boxes: bool = True
 
@@ -596,18 +640,16 @@ def create_runs(pid: str, body: RunIn):
     if o.end is not None and o.end <= o.start:
         raise HTTPException(400, "End time must be after start time")
 
-    def detect_calls(it):
-        if it["kind"] == "image":
-            return 1
-        opts = {"start": o.start, "end": o.end, "detect_fps": o.detect_fps}
-        return len(pipelines.detect_video_plan(it["meta"], opts, DETECT_MAX_FRAMES)["keyframes"])
-
     if body.task == "detect":
         if not OPENROUTER_KEY:
             raise HTTPException(503, "Object detection is not configured on this server (no OpenRouter key).")
         if body.model not in detector.MODELS:
             raise HTTPException(400, "Choose a detection model")
-        n_calls = sum(detect_calls(it) for it in items)
+        videos = [it["name"] for it in items if it["kind"] == "video"]
+        if videos:
+            raise HTTPException(400, "Object detection works on photos only. Use Segmentation for videos "
+                                     f"({', '.join(videos[:3])}{'…' if len(videos) > 3 else ''}).")
+        n_calls = len(items)
         try:
             budget.check(detector.estimate_cost(body.model, n_calls))
         except BudgetExceeded as e:
@@ -625,13 +667,10 @@ def create_runs(pid: str, body: RunIn):
             if o.start >= it["meta"]["duration"]:
                 raise HTTPException(400, f"'{it['name']}' is only {it['meta']['duration']:.1f}s long; "
                                          "the start time is past its end")
-            if body.task == "segment":
-                opts["max_frames"] = min(o.max_frames, MAX_FRAMES_LIMIT)
-                _, _, _, total = plan_frames(it["meta"], Options(start=o.start, end=o.end,
-                                                                 max_frames=opts["max_frames"]))
-            else:
-                opts["detect_fps"] = o.detect_fps
-                total = detect_calls(it)
+            opts["max_frames"] = min(o.max_frames, MAX_FRAMES_LIMIT)
+            opts["max_objects"] = MAX_TRACK_OBJECTS
+            _, _, _, total = plan_frames(it["meta"], Options(start=o.start, end=o.end,
+                                                             max_frames=opts["max_frames"]))
         else:
             total = 1
         planned.append((it, opts, total))
@@ -715,7 +754,7 @@ def _dl_name(run, suffix):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", f"{stem}_{labels}")[:80] + f"_{task}{suffix}"
 
 
-RUN_FILES = {"result.jpg": "image/jpeg", "result.mp4": "video/mp4", "result.json": "application/json",
+RUN_FILES = {"result.jpg": "image/jpeg", "result.mp4": "video/mp4", "view.mp4": "video/mp4", "result.json": "application/json",
              "mask.png": "image/png", "thumb.jpg": "image/jpeg"}
 
 
@@ -725,6 +764,8 @@ def run_file(pid: str, rid: str, name: str, download: int = 0):
     if name not in RUN_FILES:
         raise HTTPException(404, "not found")
     path = rdir(run) / name
+    if name == "view.mp4" and not path.exists():   # runs from before light copies existed
+        path = rdir(run) / "result.mp4"
     if run["state"] != "done" or not path.exists():
         raise HTTPException(404, "not ready")
     suffix = {"result.json": ".json", "mask.png": "_mask.png"}.get(name, Path(name).suffix)

@@ -139,6 +139,24 @@ def color_for(obj_id):
     return int(r * 255), int(g * 255), int(b * 255)
 
 
+def clean_mask(mask: np.ndarray, min_frac=0.1, min_px=30):
+    """Drop stray specks far from the object: keep connected parts at least `min_frac` of the
+    largest part. Returns (mask, box or None). Stray pixels otherwise stretch the box across the frame."""
+    m = mask.astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 2:   # empty or a single part
+        if n <= 1:
+            return mask, None
+        x, y, w, h = stats[1, :4]
+        return mask, [float(x), float(y), float(x + w), float(y + h)]
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep = [i + 1 for i, a in enumerate(areas) if a >= max(min_px, min_frac * areas.max())]
+    cleaned = np.isin(lab, keep)
+    xs = [stats[i, 0] for i in keep]; ys = [stats[i, 1] for i in keep]
+    xe = [stats[i, 0] + stats[i, 2] for i in keep]; ye = [stats[i, 1] + stats[i, 3] for i in keep]
+    return cleaned, [float(min(xs)), float(min(ys)), float(max(xe)), float(max(ye))]
+
+
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
@@ -214,6 +232,32 @@ class FfmpegWriter:
         Path(self.path).unlink(missing_ok=True)
 
 
+KEEP_RECENT_FRAMES = 20   # SAM 3 reads mask memories from the last 6 frames and object pointers from the last 15
+KEEP_COND_FRAMES = 4      # it attends to the 4 closest conditioning frames (max_cond_frame_num)
+_SMALL_KEYS = ("object_pointer", "object_score_logits")
+
+
+def prune_session(session, frame_idx: int):
+    """Free per-frame tracking state SAM 3 will never read again (forward tracking).
+
+    Without this, every processed frame keeps ~2 MB per tracked object for the whole run,
+    so memory grows without bound on long, busy videos."""
+    cutoff = frame_idx - KEEP_RECENT_FRAMES
+    for out in session.output_dict_per_obj.values():
+        non_cond = out["non_cond_frame_outputs"]
+        for f in [f for f in non_cond if f < cutoff]:
+            del non_cond[f]
+        cond = out["cond_frame_outputs"]
+        recent = set(sorted(cond)[-KEEP_COND_FRAMES:])
+        for f, data in cond.items():
+            if f < cutoff and f not in recent and isinstance(data, dict) and len(data) > len(_SMALL_KEYS):
+                # keep the tiny object pointer (still used); drop masks and memory features
+                cond[f] = {k: v for k, v in data.items() if k in _SMALL_KEYS}
+    for per_frame in session.mask_inputs_per_obj.values():
+        for f in [f for f in per_frame if f < cutoff]:
+            del per_frame[f]
+
+
 class Sam3Tracker:
     def __init__(self, token=None, device=None, dtype="fp16"):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -222,8 +266,13 @@ class Sam3Tracker:
         self.processor = Sam3VideoProcessor.from_pretrained(MODEL_ID, token=token)
 
     def run(self, video_path, targets: list[Target], out_dir, opts: Options = Options(),
-            on_progress=lambda p: None, should_cancel=lambda: False, label_colors=None) -> dict:
-        """Track `targets` in the video and write tracked.mp4 + tracks.json into out_dir."""
+            on_progress=lambda p: None, should_cancel=lambda: False, label_colors=None,
+            max_objects: int = 10000, state_device: str | None = None) -> dict:
+        """Track `targets` in the video and write tracked.mp4 + tracks.json into out_dir.
+
+        max_objects caps how many objects SAM 3 tracks at once (GPU memory grows with each);
+        state_device="cpu" keeps the per-object tracking memory in RAM instead of the GPU."""
+        self.model.max_num_objects = max_objects
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         meta = video_meta(video_path)
@@ -266,12 +315,42 @@ class Sam3Tracker:
             src_indices = [i for i, _ in frames]
             session = self.processor.init_video_session(
                 video=[f for _, f in frames], inference_device=self.device,
+                inference_state_device=state_device or self.device,
                 video_storage_device="cpu", processing_device="cpu", dtype=self.dtype)
             session = self.processor.add_text_prompt(session, prompts)
 
+            model = self.model
+            analysed_ref = [0]
+
+            def frames_out():
+                """Same as model.propagate_in_video_iterator, but reports progress while SAM 3
+                holds back its first `hotstart_delay` frames to confirm which objects are real."""
+                order, end = model._get_processing_order(session, 0, None, reverse=False)
+                buf, analysed = [], 0
+                for fi in order:
+                    if should_cancel():
+                        raise Cancelled()
+                    out = model(inference_session=session, frame_idx=fi, reverse=False)
+                    prune_session(session, fi)
+                    analysed += 1
+                    analysed_ref[0] = analysed
+                    if model.hotstart_delay > 0:
+                        buf.append(out)
+                        session.hotstart_removed_obj_ids.update(out.removed_obj_ids)
+                        if fi == end:
+                            ready, buf = buf, []
+                        elif len(buf) >= model.hotstart_delay:
+                            ready, buf = buf[:1], buf[1:]
+                        else:
+                            ready = []
+                            on_progress(Progress("preparing", analysed, n_total))
+                    else:
+                        ready = [out]
+                    yield from ready
+
             def results():
                 with torch.inference_mode():
-                    for out in self.model.propagate_in_video_iterator(session):
+                    for out in frames_out():
                         i = out.frame_idx
                         yield src_indices[i], frames[i][1], self.processor.postprocess_outputs(session, out)
                         frames[i] = (src_indices[i], None)  # free the frame once rendered
@@ -293,9 +372,12 @@ class Sam3Tracker:
                     if score < opts.score_thresh:
                         continue
                     lab = obj_to_label.get(oid, "?")
+                    mask, box = clean_mask(masks[k])
+                    if box is None:
+                        continue
                     seen.setdefault(lab, set()).add(oid)
-                    dets.append({"id": oid, "class": lab, "score": score, "box": res["boxes"][k].tolist(),
-                                 "mask": masks[k],
+                    dets.append({"id": oid, "class": lab, "score": score, "box": box,
+                                 "mask": mask,
                                  "color": instance_color(label_colors[lab], oid) if label_colors and lab in label_colors
                                  else color_for(oid)})
 
@@ -310,7 +392,7 @@ class Sam3Tracker:
                     "objects": [{"id": d["id"], "class": d["class"], "score": round(d["score"], 4),
                                  "box": [round(v, 1) for v in d["box"]]} for d in dets]})
                 n += 1
-                on_progress(Progress("tracking", n, n_total, vis, counts))
+                on_progress(Progress("tracking", max(n, analysed_ref[0]) if not opts.stream else n, n_total, vis, counts))
             if writer is None:
                 raise ValueError("no frames were processed")
             on_progress(Progress("encoding", n, n_total))
@@ -356,7 +438,7 @@ def mask_polygons(mask: np.ndarray, max_points=200) -> list[list[float]]:
 
 
 def _segment_image(self, image_rgb: np.ndarray, targets: list[Target], score_thresh=0.0,
-                   alpha=0.45, boxes=True, label_colors=None) -> dict:
+                   alpha=0.45, boxes=True, label_colors=None, max_objects: int = 10000) -> dict:
     """Segment every instance of `targets` in one RGB image.
 
     Returns the annotated RGB image, an instance-id mask (0 = background, k = object k)
@@ -366,6 +448,7 @@ def _segment_image(self, image_rgb: np.ndarray, targets: list[Target], score_thr
     for t in targets:
         prompt_to_label.setdefault(t.prompt, t.label)
     labels = list(dict.fromkeys(t.label for t in targets))
+    self.model.max_num_objects = max_objects
     session = self.processor.init_video_session(
         video=[image_rgb], inference_device=self.device,
         video_storage_device="cpu", processing_device="cpu", dtype=self.dtype)
@@ -390,10 +473,12 @@ def _segment_image(self, image_rgb: np.ndarray, targets: list[Target], score_thr
             score = float(res["scores"][k])
             if score < score_thresh:
                 continue
-            m = masks[k]
+            m, cbox = clean_mask(masks[k])
+            if cbox is None:
+                continue
             n = len(objects) + 1
             inst[m & (inst == 0)] = n
-            box = [round(float(v), 1) for v in res["boxes"][k].tolist()]
+            box = [round(v, 1) for v in cbox]
             objects.append({"id": n, "class": obj_to_label.get(oid, "?"), "score": round(score, 4),
                             "box": box, "area": int(m.sum()), "polygons": mask_polygons(m)})
             dets.append({"id": n, "class": objects[-1]["class"], "score": score, "box": box,

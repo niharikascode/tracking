@@ -10,23 +10,21 @@ Every run writes into its own directory:
 import json
 import math
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 import detector
-from tracker import (Cancelled, FfmpegWriter, Options, Progress, Target, counts_banner, hex_to_rgb,
-                     text_color, video_meta)
+from tracker import Options, Progress, Target, counts_banner, hex_to_rgb, text_color
 
 # default label colours, in the order labels are added (the page uses the same list)
 PALETTE = ["#2f6fed", "#e5484d", "#30a46c", "#f5a524", "#8e4ec6",
            "#12a594", "#e93d82", "#0090ff", "#ff8b3e", "#6e56cf"]
-DETECT_PARALLEL = 4      # concurrent model calls within one video run
-MAX_OUT_FPS = 30         # detection videos are re-encoded at most at this frame rate
 
 
 # ----------------------------------------------------------------------------- budget
@@ -123,84 +121,27 @@ def save_thumb(path: Path, rgb: np.ndarray, width=480):
     save_jpg(path, rgb, 80)
 
 
+def make_view_copy(src: Path, dest: Path, max_width=1280):
+    """Light H.264 copy for in-browser viewing (<=720p-ish, ~2 Mbit/s, starts playing at once).
+
+    Originals can be 4K at 24 Mbit/s, more than the public link carries, so they stall."""
+    tmp = dest.with_suffix(".tmp.mp4")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-an",
+           "-vf", f"scale='min({max_width},iw)':-2", "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "26", "-maxrate", "2500k", "-bufsize", "5000k", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", str(tmp)]
+    if subprocess.run(cmd, capture_output=True).returncode == 0 and tmp.exists():
+        tmp.replace(dest)
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
+
+
 def load_rgb(path: Path) -> np.ndarray:
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise ValueError("could not read image")
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-
-# ----------------------------------------------------------------------------- planning
-
-def detect_video_plan(meta: dict, options: dict, max_calls: int) -> dict:
-    """Which frames the detector looks at: `detect_fps` checks per second over [start, end]."""
-    fps = meta["fps"]
-    first = max(0, int(round(options.get("start", 0) * fps)))
-    last = meta["frames"] if options.get("end") is None else min(meta["frames"], int(round(options["end"] * fps)))
-    span = max(0, last - first)
-    rate = float(options.get("detect_fps", 1.0))
-    n = max(1, min(max_calls, math.ceil(span / fps * rate) + 1)) if span else 0
-    if n == 1:
-        keys = [first + span // 2] if span else []
-    else:  # evenly from the first to the last frame, so boxes exist for the whole range
-        keys = sorted({first + round(i * (span - 1) / (n - 1)) for i in range(n)})
-    return {"first": first, "last": last, "keyframes": keys}
-
-
-# ----------------------------------------------------------------------------- box interpolation
-
-def _box_dist(a, b) -> float:
-    """Centre distance relative to the boxes' mean diagonal (0 = same place)."""
-    ca = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2)
-    cb = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
-    diag = (math.hypot(a[2] - a[0], a[3] - a[1]) + math.hypot(b[2] - b[0], b[3] - b[1])) / 2 or 1
-    return math.hypot(ca[0] - cb[0], ca[1] - cb[1]) / diag
-
-
-def match_objects(prev: list[dict], nxt: list[dict], max_dist=0.75) -> list[tuple[int, int]]:
-    """Greedy one-to-one matching of same-label boxes between two keyframes."""
-    pairs = sorted((_box_dist(p["box"], q["box"]), i, j)
-                   for i, p in enumerate(prev) for j, q in enumerate(nxt) if p["class"] == q["class"])
-    used_i, used_j, out = set(), set(), []
-    for d, i, j in pairs:
-        if d > max_dist:
-            break
-        if i not in used_i and j not in used_j:
-            used_i.add(i)
-            used_j.add(j)
-            out.append((i, j))
-    return out
-
-
-def interpolate(prev: list[dict], nxt: list[dict], t: float, matches) -> list[dict]:
-    """Boxes at fraction t (0..1) between two keyframes: matched boxes glide, unmatched
-    ones are only shown near their own keyframe."""
-    out, mi, mj = [], {i for i, _ in matches}, {j for _, j in matches}
-    for i, j in matches:
-        a, b = prev[i]["box"], nxt[j]["box"]
-        out.append({"class": prev[i]["class"], "box": [a[k] + (b[k] - a[k]) * t for k in range(4)]})
-    out += [{"class": o["class"], "box": o["box"]} for i, o in enumerate(prev) if i not in mi and t < 0.35]
-    out += [{"class": o["class"], "box": o["box"]} for j, o in enumerate(nxt) if j not in mj and t > 0.65]
-    for n, o in enumerate(sorted(out, key=lambda o: (o["box"][1], o["box"][0]))):
-        o["id"] = n + 1
-    return out
-
-
-def reject_outlier_keyframes(results: dict, labels: list[str]) -> list[int]:
-    """Keyframes whose count is far above the others (a model glitch), to be ignored."""
-    if len(results) < 4:
-        return []
-    bad = []
-    for f, objs in results.items():
-        for lab in labels:
-            n = sum(o["class"] == lab for o in objs)
-            others = sorted(sum(o["class"] == lab for o in results[g]) for g in results if g != f)
-            med = others[len(others) // 2]
-            # far above the others (a looping answer) or a sudden empty answer among busy frames
-            if n > 2 * med + 5 or (med >= 6 and n < med / 4):
-                bad.append(f)
-                break
-    return bad
 
 
 # ----------------------------------------------------------------------------- pipelines
@@ -238,137 +179,6 @@ def detect_image(src: Path, out: Path, run: dict, budget: Budget, api_key: str,
     return {"counts": _counts(objects, labels), "cost": r["cost"]}
 
 
-def detect_video(src: Path, out: Path, run: dict, budget: Budget, api_key: str,
-                 on_progress, should_cancel, max_calls: int = 120) -> dict:
-    """Detect on keyframes (`detect_fps` per second), then render the WHOLE range at normal
-    speed, each frame showing the boxes of the most recent keyframe."""
-    meta = video_meta(src)
-    plan = detect_video_plan(meta, run["options"], max_calls)
-    keys = plan["keyframes"]
-    if not keys:
-        raise ValueError("the selected time range has no frames")
-    labels, colors, targets = _labels(run), label_colors(run), _targets(run)
-    budget.check(detector.estimate_cost(run["model"], len(keys)))
-
-    # 1) read the keyframes
-    cap = cv2.VideoCapture(str(src))
-    key_rgb = {}
-    for f in keys:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f)
-        ok, bgr = cap.read()
-        if ok:
-            key_rgb[f] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    cap.release()
-    if not key_rgb:
-        raise ValueError("could not read frames from this video")
-
-    # 2) ask the model about each keyframe, several at a time
-    results, errors = {}, []
-    lock = threading.Lock()
-    total = len(key_rgb)
-    on_progress(Progress("detecting", 0, total))
-
-    def one(f):
-        if should_cancel():
-            return f, None, "cancelled"
-        try:
-            budget.check(detector.estimate_cost(run["model"], 1))
-            r = detector.detect(Image.fromarray(key_rgb[f]), targets, run["model"], api_key)
-        except (detector.DetectionError, BudgetExceeded) as e:
-            return f, None, str(e)
-        budget.add(r["cost"])
-        with lock:
-            run["cost"] = round(run.get("cost", 0.0) + r["cost"], 5)
-        return f, r, None
-
-    with ThreadPoolExecutor(max_workers=DETECT_PARALLEL) as pool:
-        futures = [pool.submit(one, f) for f in key_rgb]
-        for fut in as_completed(futures):
-            f, r, err = fut.result()
-            if err == "cancelled":
-                continue
-            if err:
-                errors.append(err)
-            else:
-                objs = [{"id": i + 1, "class": d["label"], "box": d["box"]} for i, d in enumerate(r["objects"])]
-                results[f] = objs
-                vis = draw_boxes(key_rgb[f], objs, colors, labels)
-                on_progress(Progress("detecting", len(results) + len(errors), total, vis, _counts(objs, labels)))
-            if should_cancel():
-                for fu in futures:
-                    fu.cancel()
-    if should_cancel():
-        raise Cancelled()
-    if not results or len(errors) > total / 2:
-        raise detector.DetectionError(
-            f"{len(errors)} of {total} frames failed. First error: {errors[0] if errors else 'unknown'}")
-
-    outliers = reject_outlier_keyframes(results, labels)
-    for f in outliers:
-        if len(results) > 1:
-            del results[f]
-
-    # 3) render the full range; boxes glide between keyframes (matched by position)
-    fps = meta["fps"]
-    stride = max(1, math.ceil(fps / MAX_OUT_FPS))
-    out_fps = fps / stride
-    done_keys = sorted(results)
-    seg_matches = {k: match_objects(results[done_keys[k]], results[done_keys[k + 1]])
-                   for k in range(len(done_keys) - 1)}
-    cap = cv2.VideoCapture(str(src))
-    if plan["first"]:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, plan["first"])
-    writer, idx, k = None, plan["first"], 0
-    n_out = math.ceil((plan["last"] - plan["first"]) / stride)
-    written = 0
-    try:
-        while idx < plan["last"]:
-            ok, bgr = cap.read()
-            if not ok:
-                break
-            if (idx - plan["first"]) % stride == 0:
-                while k + 1 < len(done_keys) and done_keys[k + 1] <= idx:
-                    k += 1
-                if idx <= done_keys[0] or k == len(done_keys) - 1:
-                    objs = results[done_keys[0] if idx <= done_keys[0] else done_keys[-1]]
-                else:
-                    a_f, b_f = done_keys[k], done_keys[k + 1]
-                    objs = interpolate(results[a_f], results[b_f], (idx - a_f) / (b_f - a_f), seg_matches[k])
-                vis = draw_boxes(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), objs, colors, labels)
-                if writer is None:
-                    writer = FfmpegWriter(out / "result.mp4", vis.shape[1], vis.shape[0], out_fps)
-                writer.write(vis)
-                written += 1
-                if written % 30 == 0:
-                    if should_cancel():
-                        raise Cancelled()
-                    on_progress(Progress("rendering", written, n_out))
-            idx += 1
-        if writer is None:
-            raise ValueError("no frames could be read from the video")
-        writer.close()
-    except BaseException:
-        if writer is not None:
-            writer.abort()
-        raise
-    finally:
-        cap.release()
-    first_key = done_keys[len(done_keys) // 2]
-    save_thumb(out / "thumb.jpg", draw_boxes(key_rgb[first_key], results[first_key], colors, labels))
-
-    peak = {lab: max(sum(o["class"] == lab for o in results[f]) for f in done_keys) for lab in labels}
-    result = {"task": "detect", "model": detector.MODELS[run["model"]]["id"], "source": meta,
-              "detect_fps": run["options"].get("detect_fps", 1.0), "output_fps": round(out_fps, 3),
-              "keyframes": [{"frame": f, "time": round(f / fps, 3), "objects": results[f]} for f in done_keys],
-              "failed_keyframes": len(errors), "rejected_keyframes": [round(f / fps, 3) for f in outliers],
-              "cost_usd": round(run.get("cost", 0.0), 5), "targets": run["targets"],
-              "note": "Keyframes were checked by the model; frames in between show boxes interpolated "
-                      "between matching objects of neighbouring keyframes."}
-    (out / "result.json").write_text(json.dumps(result, indent=1))
-    return {"counts": peak, "cost": run.get("cost", 0.0), "frames": len(done_keys),
-            "failed_frames": len(errors) + len(outliers), "duration": round((plan["last"] - plan["first"]) / fps, 2)}
-
-
 def segment_image(tracker, src: Path, out: Path, run: dict, on_progress, should_cancel) -> dict:
     rgb = load_rgb(src)
     labels = _labels(run)
@@ -376,7 +186,7 @@ def segment_image(tracker, src: Path, out: Path, run: dict, on_progress, should_
     o = run["options"]
     r = tracker.segment_image(rgb, [Target(t["label"], t["description"]) for t in run["targets"]],
                               score_thresh=o.get("score_thresh", 0.0), boxes=o.get("boxes", True),
-                              label_colors=label_colors(run))
+                              label_colors=label_colors(run), max_objects=int(o.get("max_objects", 200)))
     save_jpg(out / "result.jpg", r["image"])
     save_thumb(out / "thumb.jpg", r["image"])
     cv2.imwrite(str(out / "mask.png"), r["instance_mask"])
@@ -401,9 +211,27 @@ def segment_video(tracker, src: Path, out: Path, run: dict, on_progress, should_
             first_preview[0] = False
         on_progress(p)
 
-    s = tracker.run(src, [Target(t["label"], t["description"]) for t in run["targets"]], out, opts,
-                    on_progress=progress, should_cancel=should_cancel, label_colors=label_colors(run))
+    targets = [Target(t["label"], t["description"]) for t in run["targets"]]
+    max_objects = int(o.get("max_objects", 20))
+    # tracking state is pruned every frame (tracker.prune_session), so memory stays flat;
+    # if the GPU still runs out, retry once with that state in RAM
+    offloaded = False
+    try:
+        s = tracker.run(src, targets, out, opts, on_progress=progress, should_cancel=should_cancel,
+                        label_colors=label_colors(run), max_objects=max_objects)
+    except torch.OutOfMemoryError:
+        # too many objects for the GPU: retry with the tracking memory kept in RAM (slower)
+        torch.cuda.empty_cache()
+        on_progress(Progress("retrying", 0, run.get("total", 0)))
+        run["note"] = "Ran out of GPU memory; retried with tracking memory in RAM (slower)."
+        s = tracker.run(src, targets, out, opts, on_progress=progress, should_cancel=should_cancel,
+                        label_colors=label_colors(run), max_objects=max_objects, state_device="cpu")
+        offloaded = True
     (out / "tracked.mp4").rename(out / "result.mp4")
     (out / "tracks.json").rename(out / "result.json")
+    on_progress(Progress("encoding", run.get("total", 0), run.get("total", 0)))
+    make_view_copy(out / "result.mp4", out / "view.mp4")
     return {"counts": s["unique_tracks_per_class"], "frames": s["frames_processed"],
-            "seconds": s["seconds"], "stride": s["stride"], "output_fps": s["output_fps"]}
+            "seconds": s["seconds"], "stride": s["stride"], "output_fps": s["output_fps"],
+            "sec_per_frame": round(s["seconds"] / max(1, s["frames_processed"]), 2),
+            "max_objects": max_objects, "offloaded_to_ram": offloaded}

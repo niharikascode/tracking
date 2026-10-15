@@ -278,6 +278,7 @@ details.settings[open] summary::after { transform: rotate(-135deg); }
 .viewer-body { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
 .stage { background: #0f1520; display: grid; place-items: center; min-height: 0; position: relative; overflow: hidden; }
 .stage img, .stage video { max-width: 100%; max-height: 100%; display: block; }
+.stage .layer { position: absolute; inset: 0; display: grid; place-items: center; }
 .stage .stage-msg { color: #c9d3e0; text-align: center; padding: 20px; display: flex; flex-direction: column; gap: 10px; align-items: center; }
 .stage .overlay-progress { position: absolute; left: 16px; right: 16px; bottom: 16px; background: rgba(15, 21, 32, .82); color: #fff; border-radius: 10px; padding: 10px 12px; font-size: 13px; }
 .stage .overlay-progress .bar { background: rgba(255, 255, 255, .2); margin-top: 6px; }

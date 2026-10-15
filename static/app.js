@@ -145,7 +145,7 @@ const state = {
 };
 
 function loadForm() {
-  const defaults = { start: 0, end: null, max_frames: 150, detect_fps: 1, score_thresh: 0, boxes: true };
+  const defaults = { start: 0, end: null, max_frames: 150, score_thresh: 0, boxes: true };
   try {
     const f = JSON.parse(LS.get("studio.form") || "null");
     if (f && Array.isArray(f.targets)) {
@@ -500,12 +500,12 @@ function renderAnnotate() {
         <label class="task detect${f.task === "detect" ? " on" : ""}">
           <input type="radio" name="task" value="detect" ${f.task === "detect" ? "checked" : ""} ${detOK ? "" : "disabled"}>
           <span class="t-icon">${ICON.box}</span><strong>Object detection</strong>
-          <span class="d">Boxes + labels from an AI model you pick. Uses OpenRouter credit.</span>
+          <span class="d">Boxes + labels on <b>photos</b> from an AI model you pick. Uses OpenRouter credit.</span>
         </label>
         <label class="task segment${f.task === "segment" ? " on" : ""}">
           <input type="radio" name="task" value="segment" ${f.task === "segment" ? "checked" : ""}>
           <span class="t-icon">${ICON.mask}</span><strong>Segmentation</strong>
-          <span class="d">Exact pixel masks with SAM 3 on the GPU. Videos are tracked. Free.</span>
+          <span class="d">Exact pixel masks with SAM 3 on the GPU, for photos and <b>videos</b> (tracked). Free.</span>
         </label>
       </div>
       ${detOK ? "" : `<p class="muted small" style="margin-top:8px">Object detection isn't configured on this server.</p>`}
@@ -537,18 +537,12 @@ function renderAnnotate() {
       <details class="settings" id="settings">
         <summary><span class="step-num">${f.task === "detect" ? 4 : 3}</span><h3>Settings <span class="muted small">(optional)</span></h3></summary>
         <div class="settings-grid">
-          <label class="field"><span>Video start (s)</span><input type="number" id="o-start" min="0" step="0.1" value="${f.options.start ?? 0}"></label>
-          <label class="field"><span>Video end (s)</span><input type="number" id="o-end" min="0" step="0.1" placeholder="end" value="${f.options.end ?? ""}"></label>
+          <label class="field" ${f.task === "segment" ? "" : "hidden"}><span>Video start (s)</span><input type="number" id="o-start" min="0" step="0.1" value="${f.options.start ?? 0}"></label>
+          <label class="field" ${f.task === "segment" ? "" : "hidden"}><span>Video end (s)</span><input type="number" id="o-end" min="0" step="0.1" placeholder="end" value="${f.options.end ?? ""}"></label>
           <label class="field span-2" ${f.task === "segment" ? "" : "hidden"}>
             <span class="row-between"><span>Max video frames to track</span><b id="o-mf-v">${f.options.max_frames}</b></span>
             <input type="range" id="o-mf" min="20" max="${s?.limits.max_frames ?? 600}" step="10" value="${f.options.max_frames}">
             <span class="muted small">Longer videos use every Nth frame. More frames = smoother video, slower.</span>
-          </label>
-          <label class="field span-2" ${f.task === "detect" ? "" : "hidden"}>
-            <span class="row-between"><span>Video: model checks per second</span><b id="o-fr-v">${fpsLabel(f.options.detect_fps)}</b></span>
-            <input type="range" id="o-fr" min="0" max="${FPS_STEPS.length - 1}" step="1" value="${fpsIndex(f.options.detect_fps)}">
-            <span class="muted small">The output is the full video; boxes update at each check. Each check is one paid model call
-              (max ${s?.limits.detect_max_frames ?? 120} per video).</span>
           </label>
           <label class="field span-2" ${f.task === "segment" ? "" : "hidden"}>
             <span class="row-between"><span>Hide masks below confidence</span><b id="o-sc-v">${(+f.options.score_thresh).toFixed(2)}</b></span>
@@ -575,11 +569,6 @@ function renderAnnotate() {
   bindNum("o-start", "start", (v) => Math.max(0, parseFloat(v) || 0));
   bindNum("o-end", "end", (v) => (v === "" ? null : parseFloat(v)));
   bindNum("o-mf", "max_frames", (v) => parseInt(v, 10), "o-mf-v");
-  $("o-fr")?.addEventListener("input", (e) => {
-    f.options.detect_fps = FPS_STEPS[+e.target.value];
-    $("o-fr-v").textContent = fpsLabel(f.options.detect_fps);
-    saveForm(); renderRunBox();
-  });
   bindNum("o-sc", "score_thresh", (v) => parseFloat(v), "o-sc-v");
   $("o-bx")?.addEventListener("change", (e) => { f.options.boxes = e.target.checked; saveForm(); });
   $("add-target").addEventListener("click", () => { f.targets.push({ label: "", description: "", color: nextColor(f.targets) }); saveForm(); renderTargets(true); });
@@ -634,6 +623,8 @@ function renderTargets(focusLast) {
 }
 
 function selectedItems() { return visibleItems().filter((i) => state.selected.has(i.id)); }
+// object detection runs on photos only
+function runnableItems() { return selectedItems().filter((i) => state.form.task !== "detect" || i.kind === "image"); }
 
 function planFrames(meta, o) {
   const first = Math.max(0, Math.round((o.start || 0) * meta.fps));
@@ -643,29 +634,20 @@ function planFrames(meta, o) {
   return Math.min(Math.ceil(span / stride), o.max_frames);
 }
 
-const FPS_STEPS = [0.25, 0.5, 1, 2, 3, 5];
-function fpsIndex(v) { const i = FPS_STEPS.indexOf(+v); return i < 0 ? 2 : i; }
-function fpsLabel(v) { return +v >= 1 ? `${+v} per second` : `1 every ${Math.round(1 / v)} s`; }
-function detectCalls(meta, o, maxCalls) {
-  const first = Math.max(0, Math.round((o.start || 0) * meta.fps));
-  const last = o.end == null ? meta.frames : Math.min(meta.frames, Math.round(o.end * meta.fps));
-  const span = Math.max(0, last - first);
-  return span ? Math.max(1, Math.min(maxCalls, Math.ceil((span / meta.fps) * (o.detect_fps || 1)))) : 0;
-}
-
 function renderRunBox() {
   const box = $("run-box");
   if (!box || !state.project) return;
   const f = state.form, s = state.status;
-  const items = selectedItems();
+  const sel = selectedItems();
+  const items = runnableItems();
+  const skipped = sel.length - items.length;
   const targets = f.targets.filter((t) => t.label.trim());
   const imgs = items.filter((i) => i.kind === "image").length, vids = items.length - imgs;
   let estimate = "", disabled = !items.length || !targets.length;
   let budgetHtml = "";
   if (f.task === "detect") {
     const m = s?.models.find((x) => x.key === f.model);
-    const maxCalls = s?.limits.detect_max_frames ?? 120;
-    const calls = items.reduce((a, i) => a + (i.kind === "image" ? 1 : detectCalls(i.meta, f.options, maxCalls)), 0);
+    const calls = items.length;
     const cost = (m?.est_per_image || 0) * calls;
     const left = s?.budget_remaining ?? 0;
     estimate = items.length ? `${plural(calls, "model call")} · about <b>${fmtMoney(cost)}</b> with ${esc(m?.name || "")}` : "";
@@ -678,13 +660,21 @@ function renderRunBox() {
         ${cost > left && items.length ? `<span class="small" style="color:var(--danger)">Not enough credit left today for this — pick a cheaper model or fewer items.</span>` : ""}</div>`;
     }
   } else if (items.length) {
-    const spf = s?.sec_per_frame || 7.5;
-    const frames = items.reduce((a, i) => a + (i.kind === "image" ? 1 : planFrames(i.meta, { ...f.options, max_frames: f.options.max_frames })), 0);
-    estimate = `${plural(frames, "frame")} on the GPU · about <b>${fmtDur(frames * spf + 20 * vids + 3 * imgs)}</b>${s?.gpu_queue ? ` · ${s.gpu_queue} queued ahead` : ""}`;
+    const lo = s?.sec_per_frame || 3, hi = Math.max(lo, s?.sec_per_frame_high || lo);
+    const vframes = items.reduce((a, i) => a + (i.kind === "image" ? 0 : planFrames(i.meta, { ...f.options, max_frames: f.options.max_frames })), 0);
+    const base = 20 * vids + 4 * imgs;
+    const tLo = vframes * lo + base, tHi = vframes * hi + base;
+    const when = vframes && tHi - tLo > 60 ? `${fmtDur(tLo)}–${fmtDur(tHi)}` : fmtDur(tLo);
+    estimate = `${vframes ? `${plural(vframes, "video frame")}${imgs ? ` + ${plural(imgs, "photo")}` : ""}` : plural(imgs, "photo")} on the GPU · about <b>${when}</b>${vframes ? " (busier scenes take longer)" : ""}${s?.gpu_queue ? ` · ${s.gpu_queue} queued ahead` : ""}`;
+    if (vids && targets.length > 3) {
+      estimate += `<div class="small" style="color:var(--warn);margin-top:4px">Many labels on a video can be slow and memory-heavy on busy scenes. At most ${s?.limits.max_track_objects ?? 60} objects are tracked at once; consider splitting labels across runs.</div>`;
+    }
   }
   const what = f.task === "detect" ? "Detect objects" : "Segment";
   const label = items.length ? `${what} in ${plural(items.length, "item")}` : `${what}`;
-  const hint = !items.length ? "Select photos or videos first (click the ✓ on a tile)." : !targets.length ? "Add at least one label above." : "";
+  const hint = (skipped ? `${plural(skipped, "video")} skipped: object detection works on photos only (use Segmentation for videos). ` : "") +
+    (!items.length ? (f.task === "detect" ? "Select photos first (click the ✓ on a tile)." : "Select photos or videos first (click the ✓ on a tile).")
+      : !targets.length ? "Add at least one label above." : "");
   // keep the button element stable so a click is never lost to a re-render
   if (!$("run-btn")) {
     box.innerHTML = `<div id="rb-info"></div><button class="btn btn-primary btn-lg" id="run-btn"></button>`;
@@ -701,7 +691,7 @@ function renderRunBox() {
 
 async function startRuns() {
   const f = state.form;
-  const items = selectedItems();
+  const items = runnableItems();
   const targets = f.targets.filter((t) => t.label.trim()).map((t) => ({ label: t.label.trim(), description: t.description.trim(), color: t.color }));
   if (!targets.length) {
     document.querySelector(".t-label")?.classList.add("invalid");
@@ -709,7 +699,7 @@ async function startRuns() {
     toast("Add at least one label", "error");
     return;
   }
-  if (!items.length) { toast("Select at least one photo or video", "error"); return; }
+  if (!items.length) { toast(f.task === "detect" ? "Select at least one photo — object detection works on photos only" : "Select at least one photo or video", "error"); return; }
   const btn = $("run-btn");
   if (btn) { btn.disabled = true; btn.dataset.busy = "1"; }
   try {
@@ -738,7 +728,9 @@ function openViewer(itemId, push = true) {
   const it = state.project.items.find((i) => i.id === itemId);
   if (!it) { location.hash = `#/p/${state.project.id}`; return; }
   if (push) { location.hash = `#/p/${state.project.id}/i/${itemId}`; return; }
-  state.viewer = { itemId, runId: it.latest?.id || null, mode: "result", runs: [], shownKey: "" };
+  state.viewer = { itemId, runId: it.latest?.id || null, mode: "result", runs: [] };
+  delete $("viewer-stage").dataset.base;
+  delete $("viewer-stage").dataset.show;
   $("viewer").hidden = false;
   document.body.style.overflow = "hidden";
   refreshViewer(true);
@@ -747,8 +739,7 @@ function openViewer(itemId, push = true) {
 
 function closeViewer(push = true) {
   if (!state.viewer) return;
-  const v = $("viewer-stage").querySelector("video");
-  if (v) v.pause();
+  $("viewer-stage").querySelectorAll("video").forEach((v) => v.pause());
   state.viewer = null;
   $("viewer").hidden = true;
   document.body.style.overflow = "";
@@ -760,10 +751,15 @@ $("viewer").addEventListener("click", (e) => { if (e.target.id === "viewer") clo
 $("viewer-prev").addEventListener("click", () => stepViewer(-1));
 $("viewer-next").addEventListener("click", () => stepViewer(1));
 $("viewer-mode").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
-  if (!state.viewer) return;
-  state.viewer.mode = b.dataset.mode;
-  state.viewer.shownKey = "";
-  refreshViewer();
+  const v = state.viewer;
+  if (!v) return;
+  v.mode = b.dataset.mode;
+  // switch instantly from what's already loaded; no network round-trip
+  if (v.last) {
+    const showResult = v.mode === "result" && v.last.run;
+    $("viewer-mode").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.mode === (showResult ? "result" : "original")));
+    renderStage(v.last.it, v.last.run, showResult);
+  }
 }));
 document.addEventListener("keydown", (e) => {
   if (!state.viewer || document.querySelector("dialog[open]")) return;
@@ -796,25 +792,37 @@ async function refreshViewer(first) {
   $("viewer-next").disabled = idx < 0 || idx >= items.length - 1;
   const showResult = v.mode === "result" && run;
   $("viewer-mode").querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.mode === (showResult ? "result" : "original")));
+  v.last = { it, run };
   renderStage(it, run, showResult);
   renderViewerSide(it, run);
 }
 
 function renderStage(it, run, showResult) {
+  // Both layers stay in the DOM; toggling Result/Original only switches visibility, so nothing
+  // reloads and videos keep their position.
   const pid = state.project.id, stage = $("viewer-stage"), v = state.viewer;
-  let key, html;
-  if (!showResult) {
-    key = `orig:${it.id}`;
-    html = it.kind === "video"
-      ? `<video controls playsinline preload="metadata" src="/api/projects/${pid}/items/${it.id}/source"></video>`
-      : `<img alt="${esc(it.name)}" src="/api/projects/${pid}/items/${it.id}/source">`;
+  const base = `${it.id}:${run?.id || ""}`;
+  if (stage.dataset.base !== base) {
+    stage.dataset.base = base;
+    stage.innerHTML = `<div class="layer" data-l="result"></div><div class="layer" data-l="original"></div>`;
+    const orig = stage.querySelector('[data-l="original"]');
+    orig.innerHTML = it.kind === "video"
+      ? `<video controls playsinline preload="auto" src="/api/projects/${pid}/items/${it.id}/view"></video>`
+      : `<img alt="${esc(it.name)}" src="/api/projects/${pid}/items/${it.id}/view">`;
+    v.resultKey = "";
+  }
+  const resLayer = stage.querySelector('[data-l="result"]');
+  let key, html = null;
+  if (!run) {
+    key = "none";
+    html = `<div class="stage-msg"><div>Not annotated yet.</div></div>`;
   } else if (run.state === "done") {
     key = `done:${run.id}`;
     html = it.kind === "video"
-      ? `<video controls playsinline preload="metadata" src="/api/projects/${pid}/runs/${run.id}/files/result.mp4"></video>`
+      ? `<video controls playsinline preload="auto" src="/api/projects/${pid}/runs/${run.id}/files/view.mp4"></video>`
       : `<img alt="Annotated ${esc(it.name)}" src="/api/projects/${pid}/runs/${run.id}/files/result.jpg">`;
   } else if (run.state === "queued" || run.state === "running") {
-    key = `live:${run.id}:${run.preview_version}:${run.done}:${run.stage}`;
+    key = `live:${run.id}:${run.preview_version}:${run.done}:${run.stage}:${run.eta_seconds}`;
     const img = run.preview_version > 0
       ? `<img alt="Live preview" src="/api/projects/${pid}/runs/${run.id}/preview.jpg?v=${run.preview_version}">`
       : `<div class="stage-msg"><div class="spinner"></div><div>${run.state === "queued" ? (run.position > 1 ? `Waiting for the GPU · ${run.position - 1} ahead` : "Starting…") : stageText(run)}</div></div>`;
@@ -827,16 +835,32 @@ function renderStage(it, run, showResult) {
     key = `fail:${run.id}`;
     html = `<div class="stage-msg"><div style="font-size:30px">⚠</div><div>${run.state === "cancelled" ? "This run was cancelled." : esc(run.error || "This run failed.")}</div></div>`;
   }
-  if (v.shownKey === key) return;
-  // keep the playing video if only the key's live part changed
-  v.shownKey = key;
-  stage.innerHTML = html;
+  if (v.resultKey !== key) {
+    v.resultKey = key;
+    resLayer.innerHTML = html;
+  }
+  const want = showResult ? "result" : "original";
+  if (stage.dataset.show !== want) {
+    const from = stage.querySelector(`.layer[data-l="${stage.dataset.show}"] video`);
+    const to = stage.querySelector(`.layer[data-l="${want}"] video`);
+    if (from && to) {   // keep the same moment and play state when switching
+      const t = from.currentTime, playing = !from.paused;
+      from.pause();
+      const seek = () => { try { to.currentTime = Math.min(t, (to.duration || t) - 0.05); } catch { /* not ready */ } if (playing) to.play().catch(() => {}); };
+      to.readyState >= 1 ? seek() : to.addEventListener("loadedmetadata", seek, { once: true });
+    } else if (from) {
+      from.pause();
+    }
+    stage.dataset.show = want;
+    stage.querySelectorAll(".layer").forEach((l) => { l.hidden = l.dataset.l !== want; });
+  }
 }
 
 function stageText(run) {
-  return { starting: "Starting", reading: "Reading frames", preparing: "Finding objects in the first frames",
+  return { starting: "Starting", reading: "Reading frames",
+           preparing: run.done ? "Finding objects (SAM 3 confirms them over the first frames)" : "Preparing frames for SAM 3",
            tracking: "Tracking", encoding: "Saving video", detecting: run.total > 1 ? "Checking frames with the model" : "Asking the model",
-           rendering: "Drawing boxes on the full video",
+           rendering: "Drawing boxes on the full video", retrying: "Out of GPU memory — retrying with memory in RAM (slower)",
            segmenting: "Segmenting" }[run.stage] || "Working";
 }
 
@@ -878,7 +902,7 @@ function renderViewerSide(it, run) {
         run.finished_at && run.started_at ? `took ${fmtDur(run.finished_at - run.started_at)}` : "",
         fmtAgo(run.created_at),
       ].filter(Boolean).join(" · ")}</div>
-      ${run.task === "detect" && it.kind === "video" && run.state === "done" ? `<div class="small muted">Full ${fmtDur(r.duration || it.meta.duration)} video. The model checked ${r.frames} frames (${fpsLabel(run.options.detect_fps)}); in between, boxes move smoothly from one check to the next${r.failed_frames ? ` (${r.failed_frames} checks failed or looked wrong and were skipped)` : ""}. For fast motion use more checks per second.</div>` : ""}
+      ${run.task === "detect" && it.kind === "video" && run.state === "done" ? `<div class="small muted">An earlier video detection run (object detection now works on photos only).</div>` : ""}
       ${files.length ? `<div class="dl">${files.map(([n, l], i) => `<a class="btn ${i === 0 ? "btn-primary" : "btn-ghost"} btn-sm" href="/api/projects/${pid}/runs/${run.id}/files/${n}?download=1">${ICON.dl} ${l}</a>`).join("")}</div>` : ""}
       ${run.state === "failed" ? `<div class="alert alert-error">${esc(run.error)}</div>` : ""}
       <div class="dl">
@@ -929,7 +953,6 @@ function renderViewerSide(it, run) {
   $("viewer-runs").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
     state.viewer.runId = b.dataset.id;
     state.viewer.mode = "result";
-    state.viewer.shownKey = "";
     refreshViewer();
   }));
 }
