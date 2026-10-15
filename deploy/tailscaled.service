@@ -1,0 +1,11 @@
+[Unit]
+Description=Tailscale (userspace) for SAM 3 Tracker funnel
+After=network-online.target
+
+[Service]
+ExecStart=%h/bin/tailscaled --tun=userspace-networking --statedir=%h/.local/share/tailscale --socket=%h/.local/share/tailscale/tailscaled.sock --port=0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

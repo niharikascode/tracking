@@ -1,0 +1,12 @@
+# Secrets (HF token, app password)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Uploaded videos and results
+data/
+samples/
+outputs/

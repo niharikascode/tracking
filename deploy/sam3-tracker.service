@@ -1,0 +1,12 @@
+[Unit]
+Description=SAM 3 Tracker web app (port 7860)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/path/to/tracking
+ExecStart=%h/path/to/tracking/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 7860
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
