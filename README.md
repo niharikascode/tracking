@@ -64,6 +64,8 @@ The live site runs this way at a fixed, free URL, `https://sam3-tracker.<tailnet
    ts funnel status
    ```
 
+**Use Tailscale 1.105.59 (unstable) or newer.** Stable 1.104.1 has an open bug ([tailscale#21796](https://github.com/tailscale/tailscale/issues/21796)): Funnel connections that arrive over IPv6 are dropped with `Drop: TCP{...} no rules matched` in the tailscaled log, so most outside visitors get a TLS/"broken pipe" error. Get the build from https://pkgs.tailscale.com/unstable/.
+
 Useful commands: `systemctl --user status sam3-tracker`, `journalctl --user -u sam3-tracker -f`, `ts funnel --https=443 off` (take the site offline).
 
 ## Configuration (`.env`)
