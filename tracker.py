@@ -139,6 +139,24 @@ def color_for(obj_id):
     return int(r * 255), int(g * 255), int(b * 255)
 
 
+def hex_to_rgb(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def instance_color(base_rgb, n: int):
+    """Shade a label's colour per instance so neighbouring objects of one label stay distinguishable."""
+    factor = (1.0, 0.72, 1.25, 0.85, 1.12, 0.62)[n % 6]
+    if factor <= 1:
+        return tuple(int(c * factor) for c in base_rgb)
+    return tuple(int(c + (255 - c) * (factor - 1)) for c in base_rgb)
+
+
+def text_color(rgb):
+    """Black or white label text, whichever reads better on `rgb`."""
+    return (0, 0, 0) if 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2] > 140 else (255, 255, 255)
+
+
 def draw(frame_rgb, dets, alpha, draw_boxes):
     overlay = frame_rgb.copy()
     for d in dets:
@@ -157,7 +175,7 @@ def draw(frame_rgb, dets, alpha, draw_boxes):
         (tw, th), base = cv2.getTextSize(label, font, scale, thick)
         ty = y1 - 4 if y1 - th - base - 4 > 0 else y1 + th + base + 4
         cv2.rectangle(out, (x1, ty - th - base), (x1 + tw + 4, ty + base // 2), d["color"], -1)
-        cv2.putText(out, label, (x1 + 2, ty - base // 2), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+        cv2.putText(out, label, (x1 + 2, ty - base // 2), font, scale, text_color(d["color"]), thick, cv2.LINE_AA)
     return out
 
 
@@ -204,7 +222,7 @@ class Sam3Tracker:
         self.processor = Sam3VideoProcessor.from_pretrained(MODEL_ID, token=token)
 
     def run(self, video_path, targets: list[Target], out_dir, opts: Options = Options(),
-            on_progress=lambda p: None, should_cancel=lambda: False) -> dict:
+            on_progress=lambda p: None, should_cancel=lambda: False, label_colors=None) -> dict:
         """Track `targets` in the video and write tracked.mp4 + tracks.json into out_dir."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +295,9 @@ class Sam3Tracker:
                     lab = obj_to_label.get(oid, "?")
                     seen.setdefault(lab, set()).add(oid)
                     dets.append({"id": oid, "class": lab, "score": score, "box": res["boxes"][k].tolist(),
-                                 "mask": masks[k], "color": color_for(oid)})
+                                 "mask": masks[k],
+                                 "color": instance_color(label_colors[lab], oid) if label_colors and lab in label_colors
+                                 else color_for(oid)})
 
                 vis = draw(rgb, dets, opts.alpha, opts.boxes)
                 counts = {lab: sum(d["class"] == lab for d in dets) for lab in labels}
@@ -317,3 +337,71 @@ class Sam3Tracker:
         }
         (out_dir / "tracks.json").write_text(json.dumps(summary, indent=1))
         return summary
+
+
+def mask_polygons(mask: np.ndarray, max_points=200) -> list[list[float]]:
+    """Outer contours of a binary mask as flat [x1, y1, x2, y2, ...] lists (COCO style)."""
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in contours:
+        if cv2.contourArea(c) < 4:
+            continue
+        eps = 0.5
+        while len(c) > max_points:
+            c = cv2.approxPolyDP(c, eps, True)
+            eps *= 1.6
+        if len(c) >= 3:
+            polys.append([round(float(v), 1) for v in c.reshape(-1)])
+    return polys
+
+
+def _segment_image(self, image_rgb: np.ndarray, targets: list[Target], score_thresh=0.0,
+                   alpha=0.45, boxes=True, label_colors=None) -> dict:
+    """Segment every instance of `targets` in one RGB image.
+
+    Returns the annotated RGB image, an instance-id mask (0 = background, k = object k)
+    and per-object records with box, score, area and polygons.
+    """
+    prompt_to_label = {}
+    for t in targets:
+        prompt_to_label.setdefault(t.prompt, t.label)
+    labels = list(dict.fromkeys(t.label for t in targets))
+    session = self.processor.init_video_session(
+        video=[image_rgb], inference_device=self.device,
+        video_storage_device="cpu", processing_device="cpu", dtype=self.dtype)
+    session = self.processor.add_text_prompt(session, list(prompt_to_label))
+    try:
+        res = None
+        with torch.inference_mode():
+            for out in self.model.propagate_in_video_iterator(session):
+                res = self.processor.postprocess_outputs(session, out)
+    finally:
+        del session
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    h, w = image_rgb.shape[:2]
+    inst = np.zeros((h, w), dtype=np.uint16)
+    objects, dets = [], []
+    if res is not None:
+        obj_to_label = {oid: prompt_to_label.get(p, p) for p, ids in res["prompt_to_obj_ids"].items() for oid in ids}
+        masks = res["masks"].cpu().numpy()
+        for k, oid in enumerate(res["object_ids"].tolist()):
+            score = float(res["scores"][k])
+            if score < score_thresh:
+                continue
+            m = masks[k]
+            n = len(objects) + 1
+            inst[m & (inst == 0)] = n
+            box = [round(float(v), 1) for v in res["boxes"][k].tolist()]
+            objects.append({"id": n, "class": obj_to_label.get(oid, "?"), "score": round(score, 4),
+                            "box": box, "area": int(m.sum()), "polygons": mask_polygons(m)})
+            dets.append({"id": n, "class": objects[-1]["class"], "score": score, "box": box,
+                         "mask": m, "color": instance_color(label_colors[objects[-1]["class"]], n)
+                         if label_colors and objects[-1]["class"] in label_colors else color_for(n)})
+    vis = draw(image_rgb, dets, alpha, boxes)
+    counts_banner(vis, {lab: sum(o["class"] == lab for o in objects) for lab in labels})
+    return {"image": vis, "instance_mask": inst, "objects": objects}
+
+
+Sam3Tracker.segment_image = _segment_image
